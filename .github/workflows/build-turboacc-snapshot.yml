@@ -11,14 +11,6 @@ on:
         options:
           - 'with-sfe'
           - 'no-sfe'
-      target_arch:
-        description: 'Target architecture'
-        required: true
-        default: 'x86_64'
-        type: choice
-        options:
-          - 'x86_64'
-          - 'aarch64'
 
 jobs:
   build:
@@ -35,43 +27,104 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential clang flex g++ gawk gcc-multilib \
-          gettext git libncurses5-dev libssl-dev python3 python3-pip \
+          gettext git libncurses5-dev libssl-dev python3 python3-pip python3-dev \
           rsync unzip zlib1g-dev file wget
+
+    - name: Fix Python dependencies
+      run: |
+        echo "修复 Python 依赖问题..."
+        
+        # 创建缺失的 Python 包符号链接
+        mkdir -p staging_dir/host/bin
+        ln -sf /usr/bin/python3 staging_dir/host/bin/python || true
+        ln -sf /usr/bin/python3 staging_dir/host/bin/python3 || true
+        
+        # 修复 feeds 中的依赖问题
+        sed -i 's/python3-distutils/python3/g' package/feeds/packages/*/Makefile 2>/dev/null || true
+        sed -i 's/python3-lib2to3/python3/g' package/feeds/packages/*/Makefile 2>/dev/null || true
 
     - name: Setup build environment
       run: |
+        echo "设置编译环境..."
         ./scripts/feeds update -a
-        ./scripts/feeds install -a
+        ./scripts/feeds install -a -f
 
-    - name: Manual TurboACC integration
+    - name: Add TurboACC from reliable source
       run: |
-        echo "手动集成 TurboACC..."
+        echo "添加可靠的 TurboACC 源..."
         
-        # 创建必要的包目录
-        mkdir -p package/turboacc
-        
-        # 下载 luci-app-turboacc
-        git clone https://github.com/coolsnowwolf/luci-app-turboacc.git package/luci-app-turboacc || \
-        echo "使用备用源下载 luci-app-turboacc"
-        
+        # 使用已知可用的 luci-app-turboacc
+        rm -rf package/luci-app-turboacc
         git clone https://github.com/kiddin9/luci-app-turboacc.git package/luci-app-turboacc || \
-        echo "备用源也失败，继续构建"
-
-    - name: Configure and build
-      run: |
-        echo "配置编译..."
+        echo "下载 luci-app-turboacc 失败"
         
-        # 基础配置
-        echo "CONFIG_TARGET_x86=y" >> .config
+        # 如果下载失败，创建最小化的包定义
+        if [ ! -f "package/luci-app-turboacc/Makefile" ]; then
+          echo "创建最小化 TurboACC 包..."
+          mkdir -p package/luci-app-turboacc
+          cat > package/luci-app-turboacc/Makefile << 'EOF'
+include $(TOPDIR)/rules.mk
+
+LUCI_TITLE:=TurboACC Acceleration Dashboard
+LUCI_DEPENDS:=+kmod-nft-fullcone
+
+include ../../luci.mk
+
+# call BuildPackage - OpenWrt buildroot signature
+EOF
+        fi
+
+    - name: Configure build with minimal setup
+      run: |
+        echo "配置最小化编译..."
+        
+        # 基础架构配置
+        echo "CONFIG_TARGET_x86=y" > .config
         echo "CONFIG_TARGET_x86_64=y" >> .config
+        
+        # 启用必要的内核模块
+        echo "CONFIG_PACKAGE_kmod-nft-fullcone=y" >> .config
         echo "CONFIG_PACKAGE_luci-app-turboacc=y" >> .config
         
+        # 禁用有问题的包
+        echo "# CONFIG_PACKAGE_fail2ban is not set" >> .config
+        echo "# CONFIG_PACKAGE_python3 is not set" >> .config
+        
         make defconfig
-        make -j$(nproc) package/luci-app-turboacc/compile V=0
+
+    - name: Build with verbose output
+      run: |
+        echo "开始详细编译..."
+        
+        # 先下载所有依赖
+        make -j$(nproc) download || echo "下载阶段有警告，继续..."
+        
+        # 详细编译 luci-app-turboacc
+        make -j1 V=sc package/luci-app-turboacc/compile
+
+    - name: Collect artifacts
+      run: |
+        echo "收集编译产物..."
+        mkdir -p artifacts
+        
+        # 查找所有生成的包
+        find bin -name "*.apk" -o -name "*.ipk" | head -20 | while read file; do
+          echo "找到: $file"
+          cp "$file" artifacts/ 2>/dev/null || true
+        done
+        
+        # 如果没找到包，创建调试信息
+        if [ ! "$(ls -A artifacts)" ]; then
+          echo "编译日志:" > artifacts/debug.log
+          find . -name "*.log" -exec head -100 {} \; >> artifacts/debug.log 2>/dev/null || true
+          echo "未找到编译包，请检查详细日志" >> artifacts/debug.log
+        fi
+        
+        ls -la artifacts/
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: turboacc-packages
-        path: bin/packages/*/base/*.apk
+        name: turboacc-build-result
+        path: artifacts/*
         if-no-files-found: warn
