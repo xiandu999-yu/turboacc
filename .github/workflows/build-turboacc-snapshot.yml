@@ -9,12 +9,16 @@ on:
         default: 'with-sfe'
         type: choice
         options:
-        - 'with-sfe'
-        - 'no-sfe'
-
-env:
-  OPENWRT_BRANCH: "master"
-  TURBOACC_REPO: "coolsnowwolf/turboacc"  # 使用已知可用的仓库
+          - 'with-sfe'
+          - 'no-sfe'
+      target_arch:
+        description: 'Target architecture'
+        required: true
+        default: 'x86_64'
+        type: choice
+        options:
+          - 'x86_64'
+          - 'aarch64'
 
 jobs:
   build:
@@ -25,8 +29,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: openwrt/openwrt
-        ref: ${{ env.OPENWRT_BRANCH }}
-        submodules: recursive
+        ref: master
 
     - name: Install dependencies
       run: |
@@ -40,144 +43,35 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: Download and verify TurboACC script
-      run: |
-        echo "下载 TurboACC 集成脚本..."
-        
-        # 尝试多个可能的脚本源
-        SCRIPT_URLS=(
-          "https://raw.githubusercontent.com/coolsnowwolf/turboacc/master/add_turboacc.sh"
-          "https://raw.githubusercontent.com/chemnozhijin/turboacc/main/add_turboacc.sh"
-          "https://raw.githubusercontent.com/immortalwrt/immortalwrt/master/package/ctcgfw/turboacc/add_turboacc.sh"
-        )
-        
-        for url in "${SCRIPT_URLS[@]}"; do
-          echo "尝试下载: $url"
-          if curl -sSL -f "$url" -o add_turboacc.sh; then
-            echo "脚本下载成功"
-            break
-          else
-            echo "下载失败: $url"
-            rm -f add_turboacc.sh
-          fi
-        done
-        
-        # 如果所有URL都失败，使用手动方法
-        if [ ! -f "add_turboacc.sh" ]; then
-          echo "所有脚本下载失败，使用手动集成方法"
-          cat > manual_turboacc.sh << 'EOF'
-#!/bin/sh
-echo "手动集成 TurboACC..."
-# 这里添加手动集成逻辑
-EOF
-          chmod +x manual_turboacc.sh
-          cp manual_turboacc.sh add_turboacc.sh
-        fi
-        
-        # 验证脚本内容
-        echo "=== 脚本前10行内容 ==="
-        head -10 add_turboacc.sh
-        chmod +x add_turboacc.sh
-
     - name: Manual TurboACC integration
       run: |
-        echo "手动集成 TurboACC 组件..."
-        
-        # 克隆 turboacc 仓库
-        git clone https://github.com/coolsnowwolf/turboacc.git turboacc-src || \
-        git clone https://github.com/chemnozhijin/turboacc.git turboacc-src || \
-        echo "TurboACC 仓库克隆失败"
-        
-        if [ -d "turboacc-src" ]; then
-          cd turboacc-src
-          
-          # 复制补丁文件
-          find . -name "*.patch" -exec cp {} ../patches/ \; 2>/dev/null || mkdir -p ../patches
-          
-          # 复制包定义
-          mkdir -p ../package/network/config/firewall/patches
-          cp -r * ../package/ 2>/dev/null || echo "复制包文件失败"
-          cd ..
-        fi
-
-    - name: Apply TurboACC components manually
-      run: |
-        echo "手动应用 TurboACC 组件..."
+        echo "手动集成 TurboACC..."
         
         # 创建必要的包目录
         mkdir -p package/turboacc
         
         # 下载 luci-app-turboacc
-        git clone https://github.com/coolsnowwolf/luci-app-turboacc.git package/luci-app-turboacc 2>/dev/null || \
-        echo "luci-app-turboacc 下载失败"
+        git clone https://github.com/coolsnowwolf/luci-app-turboacc.git package/luci-app-turboacc || \
+        echo "使用备用源下载 luci-app-turboacc"
         
-        # 更新 feeds 以包含新包
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+        git clone https://github.com/kiddin9/luci-app-turboacc.git package/luci-app-turboacc || \
+        echo "备用源也失败，继续构建"
 
-    - name: Configure build
+    - name: Configure and build
       run: |
-        echo "配置编译选项..."
+        echo "配置编译..."
         
         # 基础配置
         echo "CONFIG_TARGET_x86=y" >> .config
         echo "CONFIG_TARGET_x86_64=y" >> .config
-        
-        # TurboACC 相关配置
         echo "CONFIG_PACKAGE_luci-app-turboacc=y" >> .config
-        echo "CONFIG_PACKAGE_kmod-nft-fullcone=y" >> .config
-        
-        if [ "${{ inputs.turboacc_type }}" = "with-sfe" ]; then
-          echo "CONFIG_PACKAGE_kmod-shortcut-fe=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-shortcut-fe-cm=y" >> .config
-        fi
         
         make defconfig
-
-    - name: Build TurboACC packages
-      run: |
-        echo "开始编译 TurboACC 包..."
-        
-        # 下载预编译组件
-        make -j$(nproc) download
-        
-        # 编译核心包
-        for pkg in luci-app-turboacc nft-fullcone; do
-          echo "编译: $pkg"
-          make package/$pkg/compile V=s || echo "$pkg 编译失败，继续..."
-        done
-        
-        if [ "${{ inputs.turboacc_type }}" = "with-sfe" ]; then
-          echo "编译: shortcut-fe"
-          make package/shortcut-fe/compile V=s || echo "shortcut-fe 编译失败"
-        fi
-
-    - name: Collect APK packages
-      run: |
-        echo "收集生成的 APK 包..."
-        mkdir -p artifacts
-        
-        # 在多个位置查找 APK 包
-        find . -name "*.apk" | grep -i -E "(turboacc|fullcone|shortcut)" > found_packages.txt || echo "未找到相关包"
-        
-        if [ -s found_packages.txt ]; then
-          echo "找到以下包:"
-          cat found_packages.txt
-          cat found_packages.txt | xargs -I {} cp {} artifacts/
-        else
-          echo "未找到 TurboACC 相关包，列出所有 APK 包:"
-          find . -name "*.apk" | head -10
-          # 复制一些示例文件用于调试
-          echo "TurboACC build completed but no packages found" > artifacts/README.txt
-        fi
-        
-        echo "=== 最终产物 ==="
-        ls -la artifacts/
+        make -j$(nproc) package/luci-app-turboacc/compile V=0
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: turboacc-packages-${{ inputs.turboacc_type }}
-        path: artifacts/*
+        name: turboacc-packages
+        path: bin/packages/*/base/*.apk
         if-no-files-found: warn
-        retention-days: 30
