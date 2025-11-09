@@ -1,0 +1,19 @@
+#!/sbin/openrc-run
+
+name="TurboACC"
+description="TCP Acceleration Engine"
+command="/usr/bin/turboacc"
+command_args="-c /etc/turboacc/turboacc.conf"
+command_background=true
+pidfile="/var/run/turboacc.pid"
+
+depend() {
+    need net
+    use dns
+    before firewall
+}
+
+start_pre() {
+    checkpath -d -o turboacc:turboacc -m 755 /var/log/turboacc
+    checkpath -d -o turboacc:turboacc -m 755 /var/run/turboacc
+}
