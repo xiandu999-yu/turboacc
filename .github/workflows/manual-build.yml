@@ -1,0 +1,40 @@
+name: Quick Manual Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Build target'
+        required: true
+        default: 'apk'
+        type: choice
+        options:
+        - apk
+        - ipk
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Build based on selection
+      run: |
+        echo "Building ${{ inputs.target }} package..."
+        
+        if [ "${{ inputs.target }}" = "apk" ]; then
+          # 构建 APK 的逻辑
+          echo "Building Alpine APK..."
+          # 这里添加 APK 构建命令
+        else
+          # 构建 IPK 的逻辑
+          echo "Building OpenWrt IPK..."
+          # 这里添加 IPK 构建命令
+        fi
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: turboacc-${{ inputs.target }}
+        path: "*.apk"  # 或者 *.ipk
