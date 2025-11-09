@@ -1,0 +1,257 @@
+name: Build TurboACC APK Package
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  release:
+    types: [ published ]
+  schedule:
+    - cron: '0 0 * * 0'  # 每周日自动构建
+
+env:
+  ALPINE_VERSION: "3.18"
+  PACKAGE_NAME: "turboacc"
+  PACKAGE_VERSION: "preview-${GITHUB_SHA:0:8}"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64, armv7]
+        include:
+          - arch: x86_64
+            abuild_arch: x86_64
+          - arch: aarch64  
+            abuild_arch: aarch64
+          - arch: armv7
+            abuild_arch: armv7
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Set up QEMU for multi-arch
+      if: matrix.arch != 'x86_64'
+      uses: docker/setup-qemu-action@v3
+
+    - name: Create build directory
+      run: |
+        mkdir -p abuild
+        cp -r src abuild/
+        cp -r files abuild/ || true
+        cp README.md abuild/ || true
+
+    - name: Generate APKBUILD for turboacc
+      run: |
+        cat > abuild/APKBUILD << 'EOF'
+        # Maintainer: TurboACC Team <turboacc@github.com>
+        pkgname=turboacc
+        pkgver={{VERSION}}
+        pkgrel=1
+        pkgdesc="TCP acceleration engine for Alpine Linux"
+        url="https://github.com/${{ github.repository }}"
+        arch="all"
+        license="GPL-2.0"
+        source="src/* files/*"
+        depends="kernel linux-firmware iptables ipset"
+        options="!check"
+        makedepends="linux-headers alpine-sdk"
+
+        prepare() {
+            cd "$srcdir"
+            echo "Preparing turboacc build environment..."
+        }
+
+        build() {
+            cd "$srcdir/src"
+            
+            # 检测是否有 Makefile 并编译
+            if [ -f "Makefile" ]; then
+                echo "Building turboacc from source..."
+                make \
+                    CC="$CC" \
+                    CXX="$CXX" \
+                    CFLAGS="$CFLAGS -D_GNU_SOURCE" \
+                    LDFLAGS="$LDFLAGS" \
+                    -j$(nproc)
+            else
+                echo "No compilation required, packaging only..."
+            fi
+        }
+
+        package() {
+            cd "$srcdir"
+            
+            # 安装二进制文件
+            if [ -f "src/turboacc" ]; then
+                install -Dm755 "src/turboacc" "$pkgdir/usr/bin/turboacc"
+            fi
+            
+            # 安装内核模块（如果有）
+            if [ -d "src/modules" ]; then
+                find "src/modules" -name "*.ko" -exec \
+                    install -Dm644 {} "$pkgdir/usr/lib/modules/" \;
+            fi
+            
+            # 安装配置文件
+            install -Dm644 "files/turboacc.conf" \
+                "$pkgdir/etc/turboacc/turboacc.conf" 2>/dev/null || true
+                
+            # 安装服务脚本
+            install -Dm755 "files/turboacc.initd" \
+                "$pkgdir/etc/init.d/turboacc" 2>/dev/null || true
+                
+            # 安装 systemd 服务文件
+            install -Dm644 "files/turboacc.service" \
+                "$pkgdir/usr/lib/systemd/system/turboacc.service" 2>/dev/null || true
+            
+            # 创建必要的目录
+            mkdir -p "$pkgdir/var/log/turboacc"
+            mkdir -p "$pkgdir/var/run/turboacc"
+            
+            # 安装文档
+            install -Dm644 "README.md" \
+                "$pkgdir/usr/share/doc/turboacc/README.md" 2>/dev/null || true
+        }
+
+        post_install() {
+            echo "TurboACC installed successfully!"
+            echo "Please configure /etc/turboacc/turboacc.conf"
+            echo "Start with: rc-service turboacc start"
+        }
+
+        post_upgrade() {
+            echo "TurboACC upgraded to version {{VERSION}}"
+        }
+        EOF
+        
+        # 替换版本变量
+        sed -i "s/{{VERSION}}/${{ env.PACKAGE_VERSION }}/g" abuild/APKBUILD
+
+    - name: Build APK package
+      run: |
+        cd abuild
+        
+        docker run --rm \
+          --platform linux/${{ matrix.arch }} \
+          -v $(pwd):/workspace \
+          -w /workspace \
+          alpine:${{ env.ALPINE_VERSION }} \
+          sh -c "
+            apk update && \
+            apk add abuild alpine-sdk linux-headers && \
+            adduser -D builder && \
+            addgroup builder abuild && \
+            mkdir -p /var/cache/distfiles && \
+            chmod a+w /var/cache/distfiles && \
+            chown -R builder:builder /workspace && \
+            su builder -c 'abuild-keygen -a -n && abuild -r -P /tmp/packages'
+          "
+
+    - name: Collect APK files
+      run: |
+        mkdir -p artifacts/${{ matrix.arch }}
+        find abuild -name "*.apk" -exec cp {} artifacts/${{ matrix.arch }} \; || true
+        find /tmp/packages -name "*.apk" -exec cp {} artifacts/${{ matrix.arch }} \; 2>/dev/null || true
+        
+        # 检查是否生成了 APK 文件
+        if [ ! \"\$(ls -A artifacts/${{ matrix.arch }})\" ]; then
+            echo \"No APK files found! Build may have failed.\"
+            exit 1
+        fi
+        
+        echo \"Generated APK files:\"
+        ls -la artifacts/${{ matrix.arch }}
+
+    - name: Upload APK artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: turboacc-${{ matrix.arch }}-preview
+        path: artifacts/${{ matrix.arch }}/*.apk
+        retention-days: 30
+        if-no-files-found: error
+
+  create-preview-release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist-packages
+
+    - name: Create preview release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: turboacc-preview-${GITHUB_SHA:0:8}
+        name: TurboACC Preview ${GITHUB_SHA:0:8}
+        body: |
+          # TurboACC Preview Build
+          
+          **Commit:** ${GITHUB_SHA}
+          **Build Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          ## Supported Architectures
+          - 🖥️ x86_64
+          - 📱 aarch64  
+          - 📟 armv7
+          
+          ## Installation
+          ```bash
+          # Install on Alpine Linux
+          apk add --allow-untrusted turboacc-preview-*.apk
+          
+          # Enable and start service
+          rc-update add turboacc
+          rc-service turboacc start
+          ```
+          
+          ## ⚠️ Preview Notice
+          This is a preview build for testing purposes and may be unstable.
+          
+          Report issues at: ${{ github.repository }}/issues
+        draft: false
+        prerelease: true
+        files: |
+          dist-packages/**/*.apk
+
+  test-basic:
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: turboacc-x86_64-preview
+        path: test-packages
+
+    - name: Validate APK structure
+      run: |
+        cd test-packages
+        apk_file=$(ls *.apk | head -1)
+        
+        # 检查 APK 文件是否存在
+        if [ ! -f "$apk_file" ]; then
+          echo "No APK file found for testing"
+          exit 1
+        fi
+        
+        echo "Testing APK: $apk_file"
+        
+        # 使用 Docker 验证 APK 结构
+        docker run --rm -v $(pwd):/test alpine:latest sh -c "
+          apk update && \
+          apk add apk-tools && \
+          cd /test && \
+          tar -tzf '$apk_file' | head -20
+        "
